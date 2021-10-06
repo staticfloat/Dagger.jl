@@ -24,6 +24,7 @@ include("lib/logging.jl")
 
 # Distributed data
 include("processor.jl")
+include("storage.jl")
 include("scopes.jl")
 include("thunk.jl")
 include("chunks.jl")
