@@ -5,7 +5,7 @@ import MemPool: DRef, poolset
 import Statistics: mean
 
 import ..Dagger
-import ..Dagger: Context, Processor, Thunk, WeakThunk, ThunkFuture, ThunkFailedException, Chunk, OSProc, AnyScope
+import ..Dagger: Context, Processor, Storage, Thunk, WeakThunk, ThunkFuture, ThunkFailedException, Chunk, OSProc, AnyScope, CPURAMStorage
 import ..Dagger: order, free!, dependents, noffspring, istask, inputs, unwrap_weak_checked, affinity, tochunk, timespan_start, timespan_finish, unrelease, procs, move, capacity, chunktype, processor, default_enabled, get_processors, get_parent, execute!, rmprocs!, addprocs!, thunk_processor, constrain, cputhreadtime
 
 const OneToMany = Dict{Thunk, Set{Thunk}}
@@ -285,7 +285,6 @@ function init_proc(state, p, log_sink)
     end
 end
 function _cleanup_proc(uid, log_sink)
-    empty!(CHUNK_CACHE) # FIXME: Should be keyed on uid!
 end
 function cleanup_proc(state, p, log_sink)
     lock(WORKER_MONITOR_LOCK) do
@@ -499,7 +498,91 @@ function Base.show(io::IO, se::SchedulingException)
     print(io, "SchedulingException ($(se.reason))")
 end
 
-const CHUNK_CACHE = Dict{Chunk,Dict{Processor,Any}}()
+struct ChunkRedirector
+    chunks::Set{Chunk}
+    lock::Threads.ReentrantLock
+end
+ChunkRedirector() = ChunkRedirector(Set{Chunk}(), Threads.ReentrantLock())
+Base.push!(cr::ChunkRedirector, c::Chunk) = lock(cr.lock) do
+    push!(cr.chunks, c)
+end
+Base.pop!(cr::ChunkRedirector, c::Chunk) = lock(cr.lock) do
+    pop!(cr.chunks, c)
+end
+Base.collect(cr::ChunkRedirector) = lock(cr.lock) do
+    collect(cr.chunks)
+end
+function Dagger.move(from_proc::Processor, to_proc::Processor, x::Chunk{ChunkRedirector})
+    from_wid = Dagger.root_worker_id(from_proc)
+    @assert Dagger.root_worker_id(to_proc) == myid()
+
+    # Ask local storage manager for chunk
+    real_x = storage_move(from_proc, to_proc, x)
+
+    if real_x === nothing
+        # Ask remote storage manager for chunk
+        real_x = remotecall(from_wid) do
+            storage_move(from_proc, to_proc, x)
+        end
+        @assert real_x !== nothing "Chunk not found: $x"
+    end
+
+    return move(from_proc, to_proc, real_x)
+end
+function storage_move(from_proc, to_proc, x::Chunk{ChunkRedirector})
+    state = STORAGE_STATE
+    lock(state.lock) do
+        if !haskey(state.cache, x)
+            # Unknown chunk
+            return nothing
+        end
+        caches = state.cache[x]
+        real_x = nothing
+
+        # Find chunk in CPURAMStorage, and return if found
+        for storage in keys(caches)
+            if storage isa CPURAMStorage
+                real_x = caches[storage]
+                break
+            end
+        end
+
+        if real_x === nothing
+            # Find chunk in other storage, and return first found
+            chunks = values(caches[storage])
+            if length(chunks) > 0
+                real_x = first(chunks)
+            else
+                # No associated chunks
+                return nothing
+            end
+        end
+
+        from_store = real_x.processor
+        to_store = best_storage(to_proc)
+        return move(from_store, to_store, real_x)
+    end
+end
+
+best_storage(p) = CPURAMStorage(Dagger.root_worker_id(p))
+
+struct StorageState
+    # original to storage to clones
+    cache::WeakKeyDict{Chunk,Dict{Processor,Chunk}}
+
+    # cached storage information
+    pressures::Dict{Storage,Real}
+    capacities::Dict{Storage,Real}
+
+    lock::Threads.ReentrantLock
+end
+
+const STORAGE_STATE = StorageState(
+    WeakKeyDict{Chunk,Dict{Processor,Chunk}}(),
+    Dict{Storage,Real}(),
+    Dict{Storage,Real}(),
+    Threads.ReentrantLock(),
+)
 
 function schedule!(ctx, state, procs=procs_to_use(ctx))
     lock(state.lock) do
@@ -838,12 +921,15 @@ function evict_all_chunks!(ctx, to_evict)
     end
 end
 function evict_chunks!(log_sink, chunks::Set{Chunk})
+    #= FIXME: Tell storage scheduler it can do (lazy) cleanup?
     ctx = Context(;log_sink)
+    sstate = STORAGE_STATE
     for chunk in chunks
         timespan_start(ctx, :evict, myid(), (;data=chunk))
         haskey(CHUNK_CACHE, chunk) && delete!(CHUNK_CACHE, chunk)
         timespan_finish(ctx, :evict, myid(), (;data=chunk))
     end
+    =#
     nothing
 end
 
@@ -969,15 +1055,16 @@ function do_task(to_proc, extra_util, thunk_id, Tf, data, send_result, persist, 
     fetched = if meta
         data
     else
+        scache = STORAGE_STATE.cache
         fetch_report.(map(Iterators.zip(data,ids)) do (x, id)
             @async begin
                 timespan_start(ctx, :move, (;thunk_id, id), (;f, id, data=x))
                 x = if x isa Chunk
-                    if haskey(CHUNK_CACHE, x)
-                        get!(CHUNK_CACHE[x], to_proc) do
+                    if haskey(scache, x)
+                        get!(scache[x], to_proc) do
                             # TODO: Choose "closest" processor of same type first
-                            some_proc = first(keys(CHUNK_CACHE[x]))
-                            some_x = CHUNK_CACHE[x][some_proc]
+                            some_proc = first(keys(scache[x]))
+                            some_x = scache[x][some_proc]
                             move(some_proc, to_proc, some_x)
                         end
                     else
@@ -988,8 +1075,8 @@ function do_task(to_proc, extra_util, thunk_id, Tf, data, send_result, persist, 
                             Threads.atomic_add!(transfer_time, time_finish - time_start)
                             Threads.atomic_add!(transfer_size, x.handle.size)
                         end
-                        CHUNK_CACHE[x] = Dict{Processor,Any}()
-                        CHUNK_CACHE[x][to_proc] = _x
+                        scache[x] = Dict{Processor,Any}()
+                        scache[x][to_proc] = _x
                         _x
                     end
                 else
@@ -1049,7 +1136,28 @@ function do_task(to_proc, extra_util, thunk_id, Tf, data, send_result, persist, 
         res = execute!(to_proc, f, fetched...)
 
         # Construct result
-        send_result || meta ? res : tochunk(res, to_proc; persist=persist, cache=persist ? true : cache)
+        if send_result || meta
+            res
+        else
+            # Wrap result in `Chunk`
+            cache = persist ? true : cache
+            storage = CPURAMStorage(myid())
+            real_chunk = tochunk(res, storage; persist, cache)
+
+            # Setup redirection `Chunk` for storage handling
+            redir = ChunkRedirector()
+            push!(redir, real_chunk)
+            redir_chunk = tochunk(redir, to_proc; persist, cache)
+
+            # Register with storage system
+            storage_cache = Dict{Processor,Chunk}()
+            storage_cache[storage] = real_chunk
+            lock(STORAGE_STATE.lock) do
+                STORAGE_STATE.cache[redir_chunk] = storage_cache
+            end
+
+            redir_chunk
+        end
     catch ex
         bt = catch_backtrace()
         RemoteException(myid(), CapturedException(ex, bt))

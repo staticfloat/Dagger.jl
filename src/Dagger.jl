@@ -83,9 +83,26 @@ function __init__()
             include("ui/video.jl")
         end
     end
+
+    # Register CPU processors and storage
     for tid in 1:Threads.nthreads()
         add_processor_callback!("__cpu_thread_$(tid)__") do
             ThreadProc(myid(), tid)
+        end
+    end
+    add_storage_callback!("__cpu_ram__") do
+        CPURAMStorage(myid())
+    end
+
+    # Register filesystem storage
+    for entry in getmounts()
+        entry.mnt_dir == "/" || continue # FIXME: Allow other mounts
+        add_storage_callback!("__fs_$(entry.mnt_fsname)__") do
+            parent = FilesystemStorage(entry.mnt_dir)
+            path = joinpath(first(DEPOT_PATH), "dagger", ".serfscache")
+            # FIXME: Properly check that path is under mnt_dir
+            mkpath(path)
+            SerializedFilesystemStorage(parent, path)
         end
     end
 end

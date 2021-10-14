@@ -58,9 +58,9 @@ init_similar(::BytesAllocd) = BytesAllocd()
 function (ba::BytesAllocd)(ev::Event{:start})
     if ev.category in (:move, :evict) && ev.timeline.data isa Chunk
         sz = Int(ev.timeline.data.handle.size)
-        if ev.category == :move && !haskey(Dagger.Sch.CHUNK_CACHE, ev.timeline.data)
+        if ev.category == :move && !haskey(Dagger.Sch.STORAGE_STATE.cache, ev.timeline.data)
             ba.allocd += sz
-        elseif ev.category == :evict && haskey(Dagger.Sch.CHUNK_CACHE, ev.timeline.data)
+        elseif ev.category == :evict && haskey(Dagger.Sch.STORAGE_STATE.cache, ev.timeline.data)
             ba.allocd -= sz
         end
     end

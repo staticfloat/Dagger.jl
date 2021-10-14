@@ -34,6 +34,7 @@ function (::ProfileMetrics)(ev)
     ExpiringFile(path)
 end
 
+# TODO: Use Dagger.ExpiringFile
 "An automatically-deleting file."
 mutable struct ExpiringFile
     path::String

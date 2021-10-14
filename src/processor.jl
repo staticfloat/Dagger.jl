@@ -13,6 +13,20 @@ make it easy to transfer data to/from other types of `Processor` at runtime.
 abstract type Processor end
 
 const PROCESSOR_CALLBACKS = Dict{Symbol,Any}()
+const OSPROC_PROCESSOR_CACHE = Dict{Int,Vector{Processor}}()
+
+add_processor_callback!(func, name::String) =
+    add_processor_callback!(func, Symbol(name))
+function add_processor_callback!(func, name::Symbol)
+    Dagger.PROCESSOR_CALLBACKS[name] = func
+    delete!(OSPROC_PROCESSOR_CACHE, myid())
+end
+delete_processor_callback!(name::String) =
+    delete_processor_callback!(Symbol(name))
+function delete_processor_callback!(name::Symbol)
+    delete!(Dagger.PROCESSOR_CALLBACKS, name)
+    delete!(OSPROC_PROCESSOR_CACHE, myid())
+end
 
 """
     execute!(proc::Processor, f, args...) -> Any
@@ -64,6 +78,8 @@ direct parent.
 """
 get_parent
 
+root_worker_id(proc::Processor) = get_parent(proc).pid
+
 """
     move(from_proc::Processor, to_proc::Processor, x)
 
@@ -94,16 +110,18 @@ computations.
 struct OSProc <: Processor
     pid::Int
     function OSProc(pid::Int=myid())
-        get!(OSPROC_CACHE, pid) do
-            remotecall_fetch(get_proc_hierarchy, pid)
+        get!(OSPROC_PROCESSOR_CACHE, pid) do
+            remotecall_fetch(get_processor_hierarchy, pid)
+        end
+        get!(OSPROC_STORAGE_CACHE, pid) do
+            remotecall_fetch(get_storage_hierarchy, pid)
         end
         new(pid)
     end
 end
-const OSPROC_CACHE = Dict{Int,Vector{Processor}}()
 get_parent(proc::OSProc) = proc
-children(proc::OSProc) = get(OSPROC_CACHE, proc.pid, Processor[])
-function get_proc_hierarchy()
+children(proc::OSProc) = get(OSPROC_PROCESSOR_CACHE, proc.pid, Processor[])
+function get_processor_hierarchy()
     children = Processor[]
     for name in keys(PROCESSOR_CALLBACKS)
         cb = PROCESSOR_CALLBACKS[name]
@@ -120,17 +138,22 @@ function get_proc_hierarchy()
     end
     children
 end
-add_processor_callback!(func, name::String) =
-    add_processor_callback!(func, Symbol(name))
-function add_processor_callback!(func, name::Symbol)
-    Dagger.PROCESSOR_CALLBACKS[name] = func
-    empty!(OSPROC_CACHE)
-end
-delete_processor_callback!(name::String) =
-    delete_processor_callback!(Symbol(name))
-function delete_processor_callback!(name::Symbol)
-    delete!(Dagger.PROCESSOR_CALLBACKS, name)
-    empty!(OSPROC_CACHE)
+function get_storage_hierarchy()
+    children = Processor[]
+    for name in keys(STORAGE_CALLBACKS)
+        cb = STORAGE_CALLBACKS[name]
+        try
+            child = Base.invokelatest(cb)
+            if (child isa Tuple) || (child isa Vector)
+                append!(children, child)
+            elseif child !== nothing
+                push!(children, child)
+            end
+        catch err
+            @error "Error in storage callback: $name" exception=(err,catch_backtrace())
+        end
+    end
+    children
 end
 Base.:(==)(proc1::OSProc, proc2::OSProc) = proc1.pid == proc2.pid
 iscompatible(proc::OSProc, opts, f, args...) =
