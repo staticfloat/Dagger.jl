@@ -53,7 +53,8 @@ Fields:
 - `worker_loadavg::Dict{Int,NTuple{3,Float64}}` - Worker load average
 - `worker_chans::Dict{Int, Tuple{RemoteChannel,RemoteChannel}}` - Communication channels between the scheduler and each worker
 - `procs_cache_list::Base.RefValue{Union{ProcessorCacheEntry,Nothing}}` - Cached linked list of processors ready to be used
-- `function_cost_cache::Dict{Type{<:Tuple},UInt64}` - Cache of estimated CPU time required to compute the given signature
+- `signature_time_cost::Dict{Type{<:Tuple},UInt64}` - Cache of estimated CPU time (in nanoseconds) required to compute calls with the given signature
+- `signature_allocation_cost::Dict{Type{<:Tuple},UInt64}` - Cache of estimated CPU RAM (in bytes) required to compute calls with the given signature
 - `transfer_rate::Ref{UInt64}` - Estimate of the network transfer rate in bytes per second
 - `halt::Base.Event` - Event indicating that the scheduler is halting
 - `lock::ReentrantLock` - Lock around operations which modify the state
@@ -76,7 +77,8 @@ struct ComputeState
     worker_loadavg::Dict{Int,NTuple{3,Float64}}
     worker_chans::Dict{Int, Tuple{RemoteChannel,RemoteChannel}}
     procs_cache_list::Base.RefValue{Union{ProcessorCacheEntry,Nothing}}
-    function_cost_cache::Dict{Type{<:Tuple},UInt64}
+    signature_time_cost::Dict{Type{<:Tuple},UInt64}
+    signature_allocation_cost::Dict{Type{<:Tuple},UInt64}
     transfer_rate::Ref{UInt64}
     halt::Base.Event
     lock::ReentrantLock
@@ -100,6 +102,7 @@ function start_state(deps::Dict, node_order, chan)
                          Dict{Int,NTuple{3,Float64}}(),
                          Dict{Int, Tuple{RemoteChannel,RemoteChannel}}(),
                          Ref{Union{ProcessorCacheEntry,Nothing}}(nothing),
+                         Dict{Type{<:Tuple},UInt64}(),
                          Dict{Type{<:Tuple},UInt64}(),
                          Ref{UInt64}(1_000_000),
                          Base.Event(),
@@ -438,7 +441,8 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
                 state.worker_pressure[pid][proc] = metadata.pressure
                 state.worker_loadavg[pid] = metadata.loadavg
                 sig = signature(node, state)
-                state.function_cost_cache[sig] = (metadata.threadtime + get(state.function_cost_cache, sig, 0)) ÷ 2
+                state.signature_time_cost[sig] = (metadata.threadtime + get(state.signature_time_cost, sig, 0)) ÷ 2
+                state.signature_allocation_cost[sig] = (metadata.gc_allocd + get(state.signature_allocation_cost, sig, 0)) ÷ 2
                 if metadata.transfer_rate !== nothing
                     state.transfer_rate[] = (state.transfer_rate[] + metadata.transfer_rate) ÷ 2
                 end
@@ -645,10 +649,10 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
             # FIXME: MaxUtilization
             extra_util = round(UInt64, get(procutil, T, 1) * 1e9)
             real_util = state.worker_pressure[gp][p]
-            if (T === Dagger.ThreadProc) && haskey(state.function_cost_cache, sig)
+            if (T === Dagger.ThreadProc) && haskey(state.signature_time_cost, sig)
                 # Assume that the extra pressure is between estimated and measured
                 # TODO: Generalize this to arbitrary processor types
-                extra_util = min(extra_util, state.function_cost_cache[sig])
+                extra_util = min(extra_util, state.signature_time_cost[sig])
             end
             # TODO: update real_util based on loadavg
             cap = typemax(UInt64)
@@ -1123,6 +1127,7 @@ function do_task(to_proc, extra_util, thunk_id, Tf, data, send_result, persist, 
     timespan_start(ctx, :compute, thunk_id, (;f, to_proc))
     res = nothing
     threadtime_start = cputhreadtime()
+    gcnum_start = Base.gc_num()
     result_meta = try
         # Set TLS variables
         Dagger.set_tls!((
@@ -1163,6 +1168,8 @@ function do_task(to_proc, extra_util, thunk_id, Tf, data, send_result, persist, 
         RemoteException(myid(), CapturedException(ex, bt))
     end
     threadtime = cputhreadtime() - threadtime_start
+    # FIXME: This is not a realistic measure of max. required memory
+    gc_allocd = Base.gc_num().allocd - gcnum_start.allocd
     timespan_finish(ctx, :compute, thunk_id, (;f, to_proc); tasks=Dagger.prof_tasks_take!(thunk_id))
     lock(TASK_SYNC) do
         real_util[] -= extra_util
@@ -1174,6 +1181,7 @@ function do_task(to_proc, extra_util, thunk_id, Tf, data, send_result, persist, 
         pressure=real_util[],
         loadavg=((Sys.loadavg()...,) ./ Sys.CPU_THREADS),
         threadtime=threadtime,
+        gc_allocd=gc_allocd,
         transfer_rate=transfer_time[] > 0 ? round(UInt64, transfer_size[] / (transfer_time[] / 10^9)) : nothing,
     )
     (result_meta, metadata)
