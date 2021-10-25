@@ -90,19 +90,25 @@ function __init__()
             ThreadProc(myid(), tid)
         end
     end
-    add_storage_callback!("__cpu_ram__") do
+    add_storage_resource_callback!("__cpu_ram__") do
         CPURAMStorage(myid())
+    end
+    add_storage_device_callback!("__cpu_ram__") do
+        CPURAMDevice(myid())
     end
 
     # Register filesystem storage
     for entry in getmounts()
         entry.mnt_dir == "/" || continue # FIXME: Allow other mounts
-        add_storage_callback!("__fs_$(entry.mnt_fsname)__") do
+        add_storage_resource_callback!("__fs_$(entry.mnt_fsname)__") do
+            FilesystemStorage(entry.mnt_dir)
+        end
+        add_storage_device_callback!("__fs_$(entry.mnt_fsname)__") do
             parent = FilesystemStorage(entry.mnt_dir)
             path = joinpath(first(DEPOT_PATH), "dagger", ".serfscache")
             # FIXME: Properly check that path is under mnt_dir
             mkpath(path)
-            SerializedFilesystemStorage(parent, path)
+            SerializedFilesystemDevice(parent, path)
         end
     end
 end

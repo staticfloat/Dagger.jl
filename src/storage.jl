@@ -1,57 +1,96 @@
 """
-    Storage <: Processor
+    StorageResource
 
-The supertype for all storage objects. Any subtype represents some storage
-device (RAM, disk, NAS, compressed RAM, etc.) where data can be stored, which
-has some maximum capacity.
+The supertype for all storage resources. Any subtype represents a physical or
+logical resource (RAM, disk, NAS, compressed RAM, etc.) where data can be
+stored, and which has some current usage level (measured in bytes) and a
+maximum capacity.
 
-`Processor` subtypes may have an associated `Storage` object (or objects) which
-are the canonical storage locations for data affiliated with the processor.
+`Processor` subtypes may have an associated `StorageResource` object (or objects)
+which are the canonical storage locations for data affiliated with the
+processor.
+
+`StorageResource`s can not be directly manipulated; a `StorageDevice` is
+required to interface with the resource.
 """
-abstract type Storage <: Processor end
-get_parent(s::Storage) = s
-storage_available(::Storage) = 0
-storage_capacity(::Storage) = 0
+abstract type StorageResource end
+storage_available(::StorageResource) = 0
+storage_pressure(s::StorageResource) = storage_capacity(s) - storage_available(s)
+storage_capacity(::StorageResource) = 0
 
-const STORAGE_CALLBACKS = Dict{Symbol,Any}()
-const OSPROC_STORAGE_CACHE = Dict{Int,Vector{Storage}}()
+"""
+    StorageDevice <: Processor
 
-add_storage_callback!(func, name::String) =
-    add_storage_callback!(func, Symbol(name))
-function add_storage_callback!(func, name::Symbol)
-    Dagger.STORAGE_CALLBACKS[name] = func
-    delete!(OSPROC_STORAGE_CACHE, myid())
+The supertype for all storage devices. Any subtype represents some method of
+utilizing a storage device, and has an associated `StorageResource`
+representing the resource being utilized.
+"""
+abstract type StorageDevice <: Processor end
+get_parent(s::StorageDevice) = s
+
+const STORAGE_RESOURCE_CALLBACKS = Dict{Symbol,Any}()
+const STORAGE_DEVICE_CALLBACKS = Dict{Symbol,Any}()
+const OSPROC_STORAGE_RESOURCE_CACHE = Dict{Int,Set{StorageResource}}()
+const OSPROC_STORAGE_DEVICE_CACHE = Dict{Int,Set{StorageDevice}}()
+
+add_storage_resource_callback!(func, name::String) =
+    add_storage_resource_callback!(func, Symbol(name))
+function add_storage_resource_callback!(func, name::Symbol)
+    Dagger.STORAGE_RESOURCE_CALLBACKS[name] = func
+    delete!(OSPROC_STORAGE_RESOURCE_CACHE, myid())
 end
-delete_storage_callback!(name::String) =
-    delete_storage_callback!(Symbol(name))
-function delete_storage_callback!(name::Symbol)
-    delete!(Dagger.STORAGE_CALLBACKS, name)
-    delete!(OSPROC_STORAGE_CACHE, myid())
+add_storage_device_callback!(func, name::String) =
+    add_storage_device_callback!(func, Symbol(name))
+function add_storage_device_callback!(func, name::Symbol)
+    Dagger.STORAGE_DEVICE_CALLBACKS[name] = func
+    delete!(OSPROC_STORAGE_DEVICE_CACHE, myid())
+end
+
+delete_storage_resource_callback!(name::String) =
+    delete_storage_resource_callback!(Symbol(name))
+function delete_storage_resource_callback!(name::Symbol)
+    delete!(Dagger.STORAGE_RESOURCE_CALLBACKS, name)
+    delete!(OSPROC_STORAGE_RESOURCE_CACHE, myid())
+end
+delete_storage_device_callback!(name::String) =
+    delete_storage_device_callback!(Symbol(name))
+function delete_storage_device_callback!(name::Symbol)
+    delete!(Dagger.STORAGE_DEVICE_CALLBACKS, name)
+    delete!(OSPROC_STORAGE_DEVICE_CACHE, myid())
 end
 
 """
-    CPURAMStorage <: Storage
+    CPURAMStorage <: StorageResource
 
-Represents data stored plainly in CPU RAM (usually DRAM).
+Represents CPU RAM (usually DRAM).
 """
-struct CPURAMStorage <: Storage
+struct CPURAMStorage <: StorageResource
     owner::Int
 end
-get_parent(s::CPURAMStorage) = OSProc(s.owner)
 storage_available(::CPURAMStorage) = Sys.free_memory()
 storage_capacity(::CPURAMStorage) = Sys.total_memory()
-function move(from::CPURAMStorage, to::CPURAMStorage, x::DRef)
+
+"""
+    CPURAMDevice <: StorageDevice
+
+Stores data plainly in CPU RAM, according to Julia's memory layout.
+"""
+struct CPURAMDevice <: StorageDevice
+    owner::Int
+end
+get_parent(s::CPURAMDevice) = OSProc(s.owner)
+storage_resource(s::CPURAMDevice) = CPURAMStorage(s.owner)
+function move(from::CPURAMDevice, to::CPURAMDevice, x::DRef)
     @assert to.owner == myid()
     poolget(x)
 end
 
 """
-    FilesystemStorage <: Storage
+    FilesystemStorage <: StorageResource
 
-Represents data stored on a filesystem at a given mountpoint. Does not have a
-canonical data representation.
+Represents a filesystem mounted at a given path.
 """
-struct FilesystemStorage <: Storage
+struct FilesystemStorage <: StorageResource
     owner::Int
     mountpoint::String
     function FilesystemStorage(mountpoint::String)
@@ -62,11 +101,11 @@ end
 get_parent(s::FilesystemStorage) = OSProc(s.owner)
 function storage_available(s::FilesystemStorage)
     vfs = statvfs(s.mountpoint)
-    return vfs.f_frsize * vfs.f_blocks
+    return vfs.f_bavail * vfs.f_bsize
 end
 function storage_capacity(s::FilesystemStorage)
     vfs = statvfs(s.mountpoint)
-    return vfs.f_frsize * vfs.f_blocks
+    return vfs.f_blocks * vfs.f_bsize
 end
 
 "An automatically-deleting file."
@@ -86,30 +125,29 @@ mutable struct ExpiringFile
 end
 
 """
-    SerializedFilesystemStorage <: FilesystemStorage
+    SerializedFilesystemDevice <: StorageDevice
 
-Represents data stored on a filesystem in a given directory.
+Represents data stored on a `StorageFilesystem` in a given directory.
 """
-struct SerializedFilesystemStorage <: Storage
-    parent::FilesystemStorage
+struct SerializedFilesystemDevice <: StorageDevice
+    filesystem::FilesystemStorage
     path::String
     id_ctr::Threads.Atomic{Int}
-    function SerializedFilesystemStorage(parent::FilesystemStorage, path::String)
+    function SerializedFilesystemDevice(filesystem::FilesystemStorage, path::String)
         @assert isdir(path) "Not a valid directory: $path"
-        new(parent, path, Threads.Atomic{Int}(1))
+        new(filesystem, path, Threads.Atomic{Int}(1))
     end
 end
-get_parent(s::SerializedFilesystemStorage) = s.parent
-storage_available(s::SerializedFilesystemStorage) = storage_available(s.parent)
-storage_capacity(s::SerializedFilesystemStorage) = storage_capacity(s.parent)
-function move(from::CPURAMStorage, to::SerializedFilesystemStorage, x::DRef)
+# FIXME: get_parent
+storage_resource(s::SerializedFilesystemDevice) = s.filesystem
+function move(from::CPURAMDevice, to::SerializedFilesystemDevice, x::DRef)
     @assert from.owner == to.owner == myid()
     id = Threads.atomic_add!(to.id_ctr, 1)
     path = joinpath(to.path, "$id")
     serialize(path, poolget(x))
     Dagger.tochunk(ExpiringFile(path), to)
 end
-function move(from::SerializedFilesystemStorage, to::CPURAMStorage, x::DRef)
+function move(from::SerializedFilesystemDevice, to::CPURAMDevice, x::DRef)
     @assert from.owner == to.owner == myid()
     path = poolget(x)
     deserialize(path.path)

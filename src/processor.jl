@@ -13,7 +13,7 @@ make it easy to transfer data to/from other types of `Processor` at runtime.
 abstract type Processor end
 
 const PROCESSOR_CALLBACKS = Dict{Symbol,Any}()
-const OSPROC_PROCESSOR_CACHE = Dict{Int,Vector{Processor}}()
+const OSPROC_PROCESSOR_CACHE = Dict{Int,Set{Processor}}()
 
 add_processor_callback!(func, name::String) =
     add_processor_callback!(func, Symbol(name))
@@ -56,18 +56,39 @@ iscompatible_arg(proc::Processor, opts, x) = false
 """
     default_enabled(proc::Processor) -> Bool
 
-Returns whether processor `proc` is enabled by default (opt-out). `Processor` subtypes can override this function to make themselves opt-in (default returns `false`).
+Returns whether processor `proc` is enabled by default. The default value is
+`false`, which is an opt-out of the processor from execution when not
+specifically requested by the user, and `true` implies opt-in, which causes the
+processor to always participate in execution when possible.
 """
 default_enabled(proc::Processor) = false
 
 """
-    get_processors(proc::Processor) -> Vector{T} where T<:Processor
+    get_processors(proc::Processor) -> Set{<:Processor}
 
-Returns the full list of processors contained in `proc`, if any. `Processor`
-subtypes should overload this function if they can contain sub-processors. The
-default method will return a `Vector` containing `proc` itself.
+Returns the set of processors contained in `proc`, if any. `Processor` subtypes
+should overload this function if they can contain sub-processors. The default
+method will return a `Vector` containing `proc` itself.
 """
-get_processors(proc::Processor) = Processor[proc]
+get_processors(proc::Processor) = Set{Processor}(proc)
+
+"""
+    get_storage_resources(proc::Processor) -> Set{<:StorageResource}
+
+Returns the full set of storage resources accessible to `proc`, if any.
+`Processor` subtypes should overload this function if they have direct access
+to any storage resources.  The default method will return an empty set.
+"""
+get_storage_resources(proc::Processor) = Set{StorageResource}()
+
+"""
+    get_storage_devices(proc::Processor) -> Set{<:StorageDevice}
+
+Returns the full set of storage devices accessible to `proc`, if any.
+`Processor` subtypes should overload this function if they have direct access
+to any storage devices.  The default method will return an empty set.
+"""
+get_storage_devices(proc::Processor) = Set{StorageDevice}()
 
 """
     get_parent(proc::Processor) -> Processor
@@ -91,6 +112,7 @@ data movement should provide implementations where `x::Chunk`.
 """
 move(from_proc::Processor, to_proc::Processor, x) = x
 
+#=
 """
     capacity(proc::Processor=OSProc()) -> Int
 
@@ -99,6 +121,7 @@ Returns the total processing capacity of `proc`.
 capacity(proc=OSProc()) = length(get_processors(proc))
 capacity(proc, ::Type{T}) where T =
     length(filter(x->x isa T, get_processors(proc)))
+=#
 
 """
     OSProc <: Processor
@@ -111,37 +134,34 @@ struct OSProc <: Processor
     pid::Int
     function OSProc(pid::Int=myid())
         get!(OSPROC_PROCESSOR_CACHE, pid) do
-            remotecall_fetch(get_processor_hierarchy, pid)
+            remotecall_fetch(detect_hierarchy, pid, :processor)
         end
-        get!(OSPROC_STORAGE_CACHE, pid) do
-            remotecall_fetch(get_storage_hierarchy, pid)
+        get!(OSPROC_STORAGE_RESOURCE_CACHE, pid) do
+            remotecall_fetch(detect_hierarchy, pid, :storage_resource)
+        end
+        get!(OSPROC_STORAGE_DEVICE_CACHE, pid) do
+            remotecall_fetch(detect_hierarchy, pid, :storage_device)
         end
         new(pid)
     end
 end
 get_parent(proc::OSProc) = proc
-children(proc::OSProc) = get(OSPROC_PROCESSOR_CACHE, proc.pid, Processor[])
-function get_processor_hierarchy()
-    children = Processor[]
-    for name in keys(PROCESSOR_CALLBACKS)
-        cb = PROCESSOR_CALLBACKS[name]
-        try
-            child = Base.invokelatest(cb)
-            if (child isa Tuple) || (child isa Vector)
-                append!(children, child)
-            elseif child !== nothing
-                push!(children, child)
-            end
-        catch err
-            @error "Error in processor callback: $name" exception=(err,catch_backtrace())
-        end
+get_processors(proc::OSProc) = get(OSPROC_PROCESSOR_CACHE, proc.pid, Set{Processor}())
+get_storage_resources(proc::OSProc) = get(OSPROC_STORAGE_RESOURCE_CACHE, proc.pid, Set{StorageResource}())
+get_storage_devices(proc::OSProc) = get(OSPROC_STORAGE_DEVICE_CACHE, proc.pid, Set{StorageDevice}())
+children(proc::OSProc) = get_processors(proc)
+function detect_hierarchy(kind::Symbol)
+    cb_dict, children = if kind == :processor
+        PROCESSOR_CALLBACKS, Set{Processor}()
+    elseif kind == :storage_resource
+        STORAGE_RESOURCE_CALLBACKS, Set{StorageResource}()
+    elseif kind == :storage_device
+        STORAGE_DEVICE_CALLBACKS, Set{StorageDevice}()
+    else
+        throw(ArgumentError("Invalid hierarchy kind: $kind"))
     end
-    children
-end
-function get_storage_hierarchy()
-    children = Processor[]
-    for name in keys(STORAGE_CALLBACKS)
-        cb = STORAGE_CALLBACKS[name]
+    for name in keys(cb_dict)
+        cb = cb_dict[name]
         try
             child = Base.invokelatest(cb)
             if (child isa Tuple) || (child isa Vector)
@@ -150,7 +170,7 @@ function get_storage_hierarchy()
                 push!(children, child)
             end
         catch err
-            @error "Error in storage callback: $name" exception=(err,catch_backtrace())
+            @error "Error in $(String(kind)) callback: $name" exception=(err,catch_backtrace())
         end
     end
     children
@@ -164,8 +184,6 @@ iscompatible_arg(proc::OSProc, opts, args...) =
     any(child->
         all(arg->iscompatible_arg(child, opts, arg), args),
     children(proc))
-get_processors(proc::OSProc) =
-    vcat((get_processors(child) for child in children(proc))...)
 
 """
     ThreadProc <: Processor
@@ -229,6 +247,7 @@ else
 end
 get_parent(proc::ThreadProc) = OSProc(proc.owner)
 default_enabled(proc::ThreadProc) = true
+storage_resource(proc::ThreadProc) = CPURAMStorage(proc.owner)
 
 # TODO: ThreadGroupProc?
 
@@ -340,7 +359,8 @@ get_tls() = (
     sch_uid=task_local_storage(:_dagger_sch_uid),
     sch_handle=task_local_storage(:_dagger_sch_handle),
     processor=thunk_processor(),
-    utilization=task_local_storage(:_dagger_utilization),
+    time_utilization=task_local_storage(:_dagger_time_utilization),
+    alloc_utilization=task_local_storage(:_dagger_alloc_utilization),
 )
 
 """
@@ -352,5 +372,6 @@ function set_tls!(tls)
     task_local_storage(:_dagger_sch_uid, tls.sch_uid)
     task_local_storage(:_dagger_sch_handle, tls.sch_handle)
     task_local_storage(:_dagger_processor, tls.processor)
-    task_local_storage(:_dagger_utilization, tls.utilization)
+    task_local_storage(:_dagger_time_utilization, tls.time_utilization)
+    task_local_storage(:_dagger_alloc_utilization, tls.alloc_utilization)
 end

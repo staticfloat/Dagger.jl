@@ -80,8 +80,6 @@ unrelease(c::Chunk) = c
 Base.:(==)(c1::Chunk, c2::Chunk) = c1.handle == c2.handle
 Base.hash(c::Chunk, x::UInt64) = hash(c.handle, x)
 
-const CHUNK_REDIRECTS = Dict{Chunk,Chunk}()
-
 collect_remote(chunk::Chunk) =
     move(chunk.processor, OSProc(), poolget(chunk.handle))
 
@@ -101,13 +99,9 @@ collect(ctx::Context, ref::FileRef; options=nothing) =
     poolget(ref) # FIXME: Do move call
 
 # Unwrap Chunk, DRef, and FileRef by default
-function move(from_proc::Processor, to_proc::Processor, x::Chunk)
-    # Handle storage redirect
-    x = haskey(CHUNK_REDIRECTS, x) ? move(CPURAMStorage(), CHUNK_REDIRECTS[x]) : x
-
-    # Move to `to_proc`
+move(from_proc::Processor, to_proc::Processor, x::Chunk) =
     move(from_proc, to_proc, x.handle)
-end
+
 move(from_proc::Processor, to_proc::Processor, x::Union{DRef,FileRef}) =
     move(from_proc, to_proc, poolget(x))
 
